@@ -11,19 +11,28 @@ from rich.live import Live
 PING_INTERVAL = 60           # seconds between cycles
 REQUEST_TIMEOUT = 30
 SUMMARY_INTERVAL = 300       # seconds for auto-summary
-BASE_URL = "https://api.nodepay.ai/api"
-PING_URL = "https://nw.nodepay.ai/api/network/ping"
+RETRY_DELAY = 15             # seconds before retrying a failed request
+
+# Nodepay API endpoints
+SESSION_API = "https://api.nodepay.ai"
+PING_API = "https://nw.nodepay.ai"
+
+ACTIVATE_ENDPOINT = f"{SESSION_API}/api/auth/active-account"
+SESSION_ENDPOINT = f"{SESSION_API}/api/auth/session"
+EARN_INFO_ENDPOINT = f"{SESSION_API}/api/earn/info"
+MISSION_ENDPOINT = f"{SESSION_API}/api/mission?platform=MOBILE"
+COMPLETE_MISSION_ENDPOINT = f"{SESSION_API}/api/mission/complete-mission"
+PING_ENDPOINT = f"{PING_API}/api/network/ping"
 
 console = Console()
 
 # ------------------ SOUND ALERT ------------------
 def alert_sound(message="Alert!"):
-    # Termux / Linux beep or TTS
     try:
-        if os.name == "posix":  # Linux/Android
+        if os.name == "posix":
             os.system(f"termux-tts-speak '{message}' 2>/dev/null || echo '\a'")
         else:
-            print("\a")  # fallback beep
+            print("\a")
     except Exception:
         print("\a")
 
@@ -59,51 +68,61 @@ class Account:
         self.claimed = 0
         self.last_ping = "N/A"
         self.last_claim_time = "N/A"
+        self.last_error = "None"
 
-# ------------------ API REQUEST ------------------
-async def fetch(session, url, token, method="GET", payload=None, proxy=None):
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    try:
-        async with session.request(method, url, headers=headers, json=payload,
-                                   proxy=proxy, timeout=REQUEST_TIMEOUT) as resp:
-            return await resp.json()
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+# ------------------ API REQUEST WITH RETRY ------------------
+async def fetch(session, url, token, method="GET", payload=None, proxy=None, account=None):
+    while True:
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        try:
+            async with session.request(method, url, headers=headers, json=payload, proxy=proxy, timeout=REQUEST_TIMEOUT) as resp:
+                data = await resp.json()
+                account.last_error = "None"
+                return data
+        except Exception as e:
+            account.last_error = str(e)
+            account.last_ping = "❌ FAIL"
+            alert_sound(f"Account {account.index} request failed, retrying in {RETRY_DELAY}s...")
+            await asyncio.sleep(RETRY_DELAY)
 
 # ------------------ TASKS ------------------
 async def check_rewards(session, account):
-    url = f"{BASE_URL}/earn/info"
-    data = await fetch(session, url, account.token, proxy=account.proxy)
+    data = await fetch(session, EARN_INFO_ENDPOINT, account.token, account=account)
     if data and data.get("success"):
         account.balance = data.get("data", {}).get("balance", 0)
+    else:
+        account.last_error = data.get("error", "Failed to fetch rewards")
+        alert_sound(f"Account {account.index} reward check failed!")
 
 async def auto_claim(session, account):
-    mission_url = f"{BASE_URL}/mission?platform=MOBILE"
-    missions = await fetch(session, mission_url, account.token, proxy=account.proxy)
+    missions = await fetch(session, MISSION_ENDPOINT, account.token, account=account)
     if not missions or not missions.get("success"):
+        account.last_error = missions.get("error", "Failed to fetch missions")
         alert_sound(f"Account {account.index} failed to fetch missions!")
         return
 
-    claim_url = f"{BASE_URL}/mission/complete-mission"
     claimed_count = 0
     for mission in missions.get("data", []):
-        if mission.get("isCompleted") is False:
+        if not mission.get("isCompleted", True):
             payload = {"missionId": mission.get("id"), "platform": "MOBILE"}
-            res = await fetch(session, claim_url, account.token, method="POST", payload=payload, proxy=account.proxy)
+            res = await fetch(session, COMPLETE_MISSION_ENDPOINT, account.token, method="POST", payload=payload, account=account)
             if res and res.get("success"):
                 claimed_count += 1
             else:
+                account.last_error = res.get("error", f"Failed to claim mission {mission.get('title')}")
                 alert_sound(f"Account {account.index} failed to claim mission {mission.get('title')}")
+
     account.claimed += claimed_count
     if claimed_count > 0:
         account.last_claim_time = datetime.now().strftime("%H:%M:%S")
 
 async def send_ping(session, account):
-    data = await fetch(session, PING_URL, account.token, method="POST", proxy=account.proxy)
+    data = await fetch(session, PING_ENDPOINT, account.token, method="POST", account=account)
     if data and data.get("success"):
         account.last_ping = "✅ OK"
     else:
         account.last_ping = "❌ FAIL"
+        account.last_error = data.get("error", "Ping failed")
         alert_sound(f"Account {account.index} ping failed!")
 
 # ------------------ WORKER ------------------
@@ -123,6 +142,7 @@ def render_table(accounts):
     table.add_column("Missions Claimed", justify="center", style="yellow")
     table.add_column("Last Ping", justify="center")
     table.add_column("Last Claim Time", justify="center", style="blue")
+    table.add_column("Last Error", justify="left", style="red")
 
     for acc in accounts:
         balance_style = "green" if float(acc.balance) > 50 else "yellow"
@@ -132,7 +152,8 @@ def render_table(accounts):
             f"[{balance_style}]{acc.balance}[/{balance_style}]",
             str(acc.claimed),
             f"[{ping_style}]{acc.last_ping}[/{ping_style}]",
-            str(acc.last_claim_time)
+            str(acc.last_claim_time),
+            str(acc.last_error)
         )
     return table
 
@@ -146,13 +167,25 @@ async def auto_summary(accounts):
 
 # ------------------ MAIN ------------------
 async def main():
+    # --- Choose proxy mode ---
+    console.print("[bold cyan]Choose proxy mode:[/bold cyan]")
+    console.print("1️⃣  Run with proxies (reads proxies.txt)")
+    console.print("2️⃣  Run without proxies")
+    choice = input("Enter choice [1/2]: ").strip()
+
+    use_proxies = choice == "1"
+    proxies = load_proxies() if use_proxies else []
+    if use_proxies and not proxies:
+        console.print("[yellow][!] proxies.txt is empty. Running without proxies[/yellow]")
+        proxies = []
+
     tokens = load_tokens()
-    proxies = load_proxies()
     if not tokens:
         return
 
     proxy_cycle = cycle(proxies) if proxies else None
     accounts = [Account(token, i+1, next(proxy_cycle) if proxy_cycle else None) for i, token in enumerate(tokens)]
+
     tasks = [asyncio.create_task(worker(acc)) for acc in accounts]
     tasks.append(asyncio.create_task(auto_summary(accounts)))
 
